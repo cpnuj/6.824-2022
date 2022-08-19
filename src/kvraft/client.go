@@ -1,13 +1,20 @@
 package kvraft
 
-import "6.824/labrpc"
+import (
+	"6.824/labrpc"
+	"sync"
+	"time"
+)
 import "crypto/rand"
 import "math/big"
-
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	mu           sync.Mutex
+	clerkID      int
+	nextPropID   int
+	cachedLeader int
 }
 
 func nrand() int64 {
@@ -21,7 +28,26 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.clerkID = int(nrand())
+	ck.nextPropID = 0
+	ck.cachedLeader = 0
 	return ck
+}
+
+func (ck *Clerk) getPropID() int {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	ret := ck.nextPropID
+	ck.nextPropID++
+	return ret
+}
+
+func callWithTimeout(fn func() chan struct{}, timeout time.Duration) {
+	doneCh := fn()
+	select {
+	case <-doneCh:
+	case <-time.After(timeout):
+	}
 }
 
 //
@@ -39,7 +65,33 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	return ""
+	args := &GetArgs{Key: key, ClerkID: ck.clerkID, PropID: ck.getPropID()}
+	reply := &GetReply{}
+	if ok := ck.servers[ck.cachedLeader].Call("KVServer.Get", args, reply); ok {
+		if reply.Err != ErrWrongLeader {
+			if reply.Err == ErrNoKey {
+				return ""
+			} else {
+				return reply.Value
+			}
+		}
+	}
+	for {
+		for i := range ck.servers {
+			if ok := ck.servers[i].Call("KVServer.Get", args, reply); ok {
+				DPrintf("%v", reply)
+				if reply.Err == ErrWrongLeader {
+					continue
+				}
+				ck.cachedLeader = i
+				if reply.Err == ErrNoKey {
+					return ""
+				} else {
+					return reply.Value
+				}
+			}
+		}
+	}
 }
 
 //
@@ -54,6 +106,37 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	args := &PutAppendArgs{
+		Key:     key,
+		Value:   value,
+		ClerkID: ck.clerkID,
+		PropID:  ck.getPropID(),
+	}
+	if op == "Append" {
+		args.Op = OpAppend
+	} else {
+		args.Op = OpPut
+	}
+	reply := &PutAppendReply{}
+	if ok := ck.servers[ck.cachedLeader].Call("KVServer.PutAppend", args, reply); ok {
+		if reply.Err == OK {
+			return
+		}
+	}
+	for {
+		for i := range ck.servers {
+			if ok := ck.servers[i].Call("KVServer.PutAppend", args, reply); ok {
+				DPrintf("%v", reply)
+				if reply.Err == ErrWrongLeader {
+					continue
+				}
+				ck.cachedLeader = i
+				if reply.Err == OK {
+					return
+				}
+			}
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

@@ -1,6 +1,8 @@
 package kvraft
 
-import "6.824/labrpc"
+import (
+	"6.824/labrpc"
+)
 import "testing"
 import "os"
 
@@ -172,6 +174,7 @@ func (cfg *config) ConnectAll() {
 
 // Sets up 2 partitions with connectivity between servers in each  partition.
 func (cfg *config) partition(p1 []int, p2 []int) {
+	// log.Printf("partition p1 %v p2 %v", p1, p2)
 	cfg.mu.Lock()
 	defer cfg.mu.Unlock()
 	// log.Printf("partition servers into: %v %v\n", p1, p2)
