@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 )
 
-const Debug = false
+const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -18,11 +18,18 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Type  string
+	Key   string
+	Value string
+}
+
+type waiter struct {
+	index int
+	ch    chan int
 }
 
 type KVServer struct {
@@ -35,15 +42,34 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+
+	waiters []waiter
 }
 
+func (kv *KVServer) addWaitIdxLocked(idx int, ch chan int) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	DPrintf("[server %d] receive get %v", kv.me, args)
+	reply.Value = "BAZ"
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	DPrintf("[server %d] receive put append %v", kv.me, args)
+	op := &Op{
+		Type:  args.Op,
+		Key:   args.Key,
+		Value: args.Value,
+	}
+	index, term, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
 }
 
 //
