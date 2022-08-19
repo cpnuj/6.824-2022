@@ -96,6 +96,10 @@ type Raft struct {
 	commitIndex  int
 	appliedIndex int
 
+	snapshot          []byte
+	lastIncludedIndex int
+	lastIncludedTerm  int
+
 	// matchIndex and nextIndex are hold by leader
 	// to track replicate progress
 	matchIndex []int
@@ -109,13 +113,16 @@ type Raft struct {
 	heartbeatElapsed int
 	heartbeatTimeout int
 
-	requestVoteArgsCh    chan *RequestVoteArgs
-	requestVoteReplyCh   chan *RequestVoteReply
-	appendEntriesArgsCh  chan *AppendEntriesArgs
-	appendEntriesReplyCh chan *AppendEntriesReply
+	requestVoteArgsCh      chan *RequestVoteArgs
+	requestVoteReplyCh     chan *RequestVoteReply
+	appendEntriesArgsCh    chan *AppendEntriesArgs
+	appendEntriesReplyCh   chan *AppendEntriesReply
+	installSnapshotArgsCh  chan *InstallSnapshotArgs
+	installSnapshotReplyCh chan *InstallSnapshotReply
 
 	getStateReqCh chan *GetStateRequest
 	startReqCh    chan *StartRequest
+	snapReqCh     chan *SnapRequest
 }
 
 type GetStateRequest struct {
@@ -136,6 +143,11 @@ type StartResponse struct {
 	Term     int
 	Index    int
 	IsLeader bool
+}
+
+type SnapRequest struct {
+	index    int
+	snapshot []byte
 }
 
 // return currentTerm and whether this server
@@ -170,11 +182,13 @@ func (rf *Raft) persist() {
 	enc := labgob.NewEncoder(w)
 	enc.Encode(rf.term)
 	enc.Encode(rf.voteFor)
+	enc.Encode(rf.lastIncludedIndex)
+	enc.Encode(rf.lastIncludedTerm)
 	enc.Encode(rf.startIndex)
 	enc.Encode(rf.commitIndex)
-	enc.Encode(rf.appliedIndex)
+	// enc.Encode(rf.appliedIndex)
 	enc.Encode(rf.entries)
-	rf.persister.SaveRaftState(w.Bytes())
+	rf.persister.SaveStateAndSnapshot(w.Bytes(), rf.snapshot)
 }
 
 //
@@ -200,23 +214,29 @@ func (rf *Raft) readPersist(data []byte) {
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 	var (
-		term         int
-		voteFor      int
-		startIndex   int
-		commitIndex  int
-		appliedIndex int
-		entries      []Entry
+		term              int
+		voteFor           int
+		lastIncludedIndex int
+		lastIncludedTerm  int
+		startIndex        int
+		commitIndex       int
+		// appliedIndex      int
+		entries []Entry
 	)
 	if d.Decode(&term) != nil || d.Decode(&voteFor) != nil ||
+		d.Decode(&lastIncludedIndex) != nil || d.Decode(&lastIncludedTerm) != nil ||
 		d.Decode(&startIndex) != nil || d.Decode(&commitIndex) != nil ||
-		d.Decode(&appliedIndex) != nil || d.Decode(&entries) != nil {
+		// d.Decode(&appliedIndex) != nil ||
+		d.Decode(&entries) != nil {
 		log.Fatalf("readPersist decode error")
 	} else {
 		rf.term = term
 		rf.voteFor = voteFor
+		rf.lastIncludedIndex = lastIncludedIndex
+		rf.lastIncludedTerm = lastIncludedTerm
 		rf.startIndex = startIndex
 		rf.commitIndex = commitIndex
-		rf.appliedIndex = appliedIndex
+		// rf.appliedIndex = appliedIndex
 		rf.entries = entries
 	}
 }
@@ -238,7 +258,11 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-
+	req := &SnapRequest{
+		index:    index,
+		snapshot: snapshot,
+	}
+	rf.snapReqCh <- req
 }
 
 //
@@ -344,6 +368,35 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
+type InstallSnapshotArgs struct {
+	From int
+	Term int
+
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Snapshot          []byte
+
+	ReplyCh chan *InstallSnapshotReply
+}
+
+type InstallSnapshotReply struct {
+	From          int
+	Term          int
+	Accept        bool
+	IncludedIndex int
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	args.ReplyCh = make(chan *InstallSnapshotReply)
+	rf.installSnapshotArgsCh <- args
+	*reply = *(<-args.ReplyCh)
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
+
 func (rf *Raft) becomeFollower() {
 	rf.state = Follower
 	rf.voteFor = nonVote
@@ -352,6 +405,10 @@ func (rf *Raft) becomeFollower() {
 
 func (rf *Raft) becomePreCandidate() {
 	rf.state = PreCandidate
+
+	// re-gen election timeout
+	rf.electionTimeout = rand.Intn(20) + 20
+
 	rf.votesAck = make(map[int]struct{})
 	rf.votesAck[rf.me] = struct{}{}
 	args := &RequestVoteArgs{
@@ -362,7 +419,7 @@ func (rf *Raft) becomePreCandidate() {
 		PreVote:   true,
 	}
 	rf.sendVoteReqs(args)
-	DPrintf("[peer %d] become pre candidate in term %d", rf.me, rf.term)
+	DPrintf("[peer %d] become pre candidate in term %d, with timeout %d", rf.me, rf.term, rf.electionTimeout)
 }
 
 func (rf *Raft) becomeCandidate() {
@@ -421,6 +478,9 @@ func (rf *Raft) becomeLeader() {
 }
 
 func (rf *Raft) termOfIndex(idx int) int {
+	if idx == rf.lastIncludedIndex {
+		return rf.lastIncludedTerm
+	}
 	return rf.entries[idx-rf.startIndex].Term
 }
 
@@ -440,6 +500,20 @@ func (rf *Raft) copyEntries(fromIndex int, size int) []Entry {
 	return to
 }
 
+// removeEntries removes size entries from head
+func (rf *Raft) removeEntries(size int) {
+	for i := 0; i < size; i++ {
+		if len(rf.entries) == 0 {
+			return
+		}
+		if len(rf.entries) == 1 {
+			rf.entries = []Entry{}
+			return
+		}
+		rf.entries = rf.entries[1:]
+	}
+}
+
 func (rf *Raft) popEntries(fromIndex int) {
 	rf.entries = rf.entries[:fromIndex-rf.startIndex]
 }
@@ -455,6 +529,24 @@ func (rf *Raft) commitEntries() {
 }
 
 func (rf *Raft) sendEntriesTo(peer int) {
+	if rf.nextIndex[peer] < rf.startIndex {
+		DPrintf("[peer %d] send snapshot to %d -- %d", rf.me, peer, rf.lastIncludedIndex)
+		args := &InstallSnapshotArgs{
+			From:              rf.me,
+			Term:              rf.term,
+			LastIncludedIndex: rf.lastIncludedIndex,
+			LastIncludedTerm:  rf.lastIncludedTerm,
+			Snapshot:          rf.snapshot,
+		}
+		go func() {
+			reply := &InstallSnapshotReply{}
+			if ok := rf.sendInstallSnapshot(peer, args, reply); ok {
+				rf.installSnapshotReplyCh <- reply
+			}
+		}()
+		return
+	}
+
 	args := &AppendEntriesArgs{
 		From:         rf.me,
 		Term:         rf.term,
@@ -601,6 +693,7 @@ func (rf *Raft) handleRequestVoteReply(reply *RequestVoteReply) {
 }
 
 func (rf *Raft) handleAppendEntriesArgs(args *AppendEntriesArgs) {
+	DPrintf("[peer %d] handleAppendEntriesArgs %v", rf.me, args)
 	reply := &AppendEntriesReply{From: rf.me}
 	defer func() {
 		args.ReplyCh <- reply
@@ -624,6 +717,11 @@ func (rf *Raft) handleAppendEntriesArgs(args *AppendEntriesArgs) {
 		fallthrough
 	case Follower:
 		rf.electionElapsed = 0
+		if args.PrevLogIndex < rf.lastIncludedIndex {
+			// the log is already truncated
+			reply.Succ = true
+			return
+		}
 		if rf.lastIndex() < args.PrevLogIndex || rf.termOfIndex(args.PrevLogIndex) != args.PrevLogTerm {
 			reply.Succ = false
 			reply.HintIndex = rf.commitIndex + 1
@@ -672,6 +770,61 @@ func (rf *Raft) handleAppendEntriesReply(reply *AppendEntriesReply) {
 	}
 }
 
+func (rf *Raft) handleInstallSnapshotArgs(args *InstallSnapshotArgs) {
+	reply := &InstallSnapshotReply{
+		From: rf.me, Term: rf.term, IncludedIndex: args.LastIncludedIndex,
+	}
+	defer func() {
+		args.ReplyCh <- reply
+	}()
+
+	if args.Term < rf.term {
+		return
+	}
+
+	if args.Term > rf.term {
+		rf.term = args.Term
+		rf.electionElapsed = 0
+		rf.becomeFollower()
+		reply.Term = rf.term
+	}
+
+	switch rf.state {
+	case Leader:
+		log.Fatalf("[peer %d] two leaders in term %d", rf.me, rf.term)
+	case PreCandidate, Candidate:
+		rf.becomeFollower()
+		fallthrough
+	case Follower:
+		rf.electionElapsed = 0
+		if args.LastIncludedIndex <= rf.lastIncludedIndex {
+			// already have a snapshot whose included index >= this one
+			reply.Accept = true
+			return
+		}
+		rf.lastIncludedTerm = args.LastIncludedTerm
+		rf.lastIncludedIndex = args.LastIncludedIndex
+		rf.snapshot = args.Snapshot
+		rf.entries = []Entry{}
+		rf.startIndex = args.LastIncludedIndex + 1
+		rf.commitIndex = rf.lastIncludedIndex
+		reply.Accept = true
+	}
+}
+
+func (rf *Raft) handleInstallSnapshotReply(reply *InstallSnapshotReply) {
+	if reply.Term > rf.term {
+		rf.term = reply.Term
+		rf.becomeFollower()
+		return
+	}
+	if reply.Term < rf.term || rf.state != Leader || !reply.Accept {
+		return
+	}
+	rf.matchIndex[reply.From] = max(rf.matchIndex[reply.From], reply.IncludedIndex)
+	rf.nextIndex[reply.From] = rf.matchIndex[reply.From] + 1
+}
+
 func (rf *Raft) handleStartRequest(req *StartRequest) {
 	if rf.state != Leader {
 		req.RespCh <- &StartResponse{IsLeader: false}
@@ -690,6 +843,22 @@ func (rf *Raft) handleStartRequest(req *StartRequest) {
 		IsLeader: true,
 	}
 	rf.sendEntries()
+}
+
+func (rf *Raft) handleSnapRequest(req *SnapRequest) {
+	DPrintf("[peer %d] snapshot index %d", rf.me, req.index)
+	if req.index < rf.lastIncludedIndex {
+		log.Fatalf("snap request index < log last include index")
+	}
+	if req.index > rf.appliedIndex {
+		log.Fatalf("snap request index > log apply index")
+	}
+	rf.lastIncludedTerm = rf.termOfIndex(req.index)
+	rf.lastIncludedIndex = req.index
+	rf.snapshot = req.snapshot
+	rf.removeEntries(req.index - rf.startIndex + 1)
+	rf.startIndex = req.index + 1
+	DPrintf("[peer %d] start index %d ents %v", rf.me, rf.startIndex, rf.entries)
 }
 
 func (rf *Raft) run() {
@@ -714,6 +883,11 @@ func (rf *Raft) run() {
 		case reply := <-rf.appendEntriesReplyCh:
 			rf.handleAppendEntriesReply(reply)
 
+		case args := <-rf.installSnapshotArgsCh:
+			rf.handleInstallSnapshotArgs(args)
+		case reply := <-rf.installSnapshotReplyCh:
+			rf.handleInstallSnapshotReply(reply)
+
 		// api msg handler
 		case req := <-rf.getStateReqCh:
 			req.RespCh <- &GetStateResponse{
@@ -722,8 +896,20 @@ func (rf *Raft) run() {
 			}
 		case req := <-rf.startReqCh:
 			rf.handleStartRequest(req)
+		case req := <-rf.snapReqCh:
+			rf.handleSnapRequest(req)
 		}
 		// TODO: ugly apply
+		DPrintf("[peer %d] last index %d apply %d include %d include term %d, start index %d", rf.me, rf.lastIndex(), rf.appliedIndex, rf.lastIncludedIndex, rf.lastIncludedTerm, rf.startIndex)
+		if rf.lastIncludedIndex > rf.appliedIndex {
+			rf.applyCh <- ApplyMsg{
+				SnapshotValid: true,
+				Snapshot:      rf.snapshot,
+				SnapshotTerm:  rf.lastIncludedTerm,
+				SnapshotIndex: rf.lastIncludedIndex,
+			}
+			rf.appliedIndex = rf.lastIncludedIndex
+		}
 		DPrintf("[peer %d] apply %d new commit %d", rf.me, rf.appliedIndex, rf.commitIndex)
 		if rf.commitIndex > rf.appliedIndex {
 			for i := rf.appliedIndex + 1; i <= rf.commitIndex; i++ {
@@ -765,11 +951,17 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		RespCh:  make(chan *StartResponse),
 	}
 	rf.startReqCh <- req
-	resp := <-req.RespCh
-	index, term, isLeader = resp.Index, resp.Term, resp.IsLeader
-	DPrintf("[start] index %d term %d isLeader %v", index, term, isLeader)
-
-	return index, term, isLeader
+	for rf.killed() == false {
+		select {
+		case resp := <-req.RespCh:
+			index, term, isLeader = resp.Index, resp.Term, resp.IsLeader
+			DPrintf("[start at %d] index %d term %d isLeader %v", rf.me, index, term, isLeader)
+			return index, term, isLeader
+		default:
+			// TODO: add context control?
+		}
+	}
+	return -1, -1, false
 }
 
 //
@@ -815,13 +1007,18 @@ func (rf *Raft) initVolatile() {
 	// heartbeat timeout every 150ms
 	rf.heartbeatTimeout = 15
 
+	rf.appliedIndex = 0
+
 	rf.requestVoteArgsCh = make(chan *RequestVoteArgs, 100)
 	rf.requestVoteReplyCh = make(chan *RequestVoteReply, 100)
 	rf.appendEntriesArgsCh = make(chan *AppendEntriesArgs, 100)
 	rf.appendEntriesReplyCh = make(chan *AppendEntriesReply, 100)
+	rf.installSnapshotArgsCh = make(chan *InstallSnapshotArgs, 100)
+	rf.installSnapshotReplyCh = make(chan *InstallSnapshotReply, 100)
 
 	rf.getStateReqCh = make(chan *GetStateRequest, 100)
 	rf.startReqCh = make(chan *StartRequest, 100)
+	rf.snapReqCh = make(chan *SnapRequest, 100)
 }
 
 func (rf *Raft) initPersist() {
@@ -829,8 +1026,11 @@ func (rf *Raft) initPersist() {
 	rf.voteFor = nonVote
 	rf.startIndex = 0
 	rf.commitIndex = 0
-	rf.appliedIndex = 0
+	// rf.appliedIndex = 0
+	rf.lastIncludedIndex = -1
+	rf.lastIncludedTerm = -1
 	rf.entries = []Entry{{Term: 0, Index: 0, Command: nil}}
+	rf.snapshot = []byte{}
 }
 
 //
@@ -854,10 +1054,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	if data := persister.ReadRaftState(); len(data) > 0 {
 		rf.readPersist(persister.ReadRaftState())
+		rf.snapshot = persister.ReadSnapshot()
 	} else {
 		rf.initPersist()
 	}
 	rf.initVolatile()
+
+	DPrintf("[peer %d] election timeout %d", rf.me, rf.electionTimeout)
 
 	rf.applyCh = applyCh
 
