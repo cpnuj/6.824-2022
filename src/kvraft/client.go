@@ -7,6 +7,7 @@ import "math/big"
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	cachedLeader int
 }
 
 func nrand() int64 {
@@ -20,6 +21,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.cachedLeader = 0
 	return ck
 }
 
@@ -40,12 +42,31 @@ func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
 	args := &GetArgs{key}
 	reply := &GetReply{}
-	for i := range ck.servers {
-		if ok := ck.servers[i].Call("KVServer.Get", args, reply); ok {
-			DPrintf("%v", reply)
+	if ok := ck.servers[ck.cachedLeader].Call("KVServer.Get", args, reply); ok {
+		if reply.Err != ErrWrongLeader {
+			if reply.Err == ErrNoKey {
+				return ""
+			} else {
+				return reply.Value
+			}
 		}
 	}
-	return reply.Value
+	for {
+		for i := range ck.servers {
+			if ok := ck.servers[i].Call("KVServer.Get", args, reply); ok {
+				DPrintf("%v", reply)
+				if reply.Err == ErrWrongLeader {
+					continue
+				}
+				ck.cachedLeader = i
+				if reply.Err == ErrNoKey {
+					return ""
+				} else {
+					return reply.Value
+				}
+			}
+		}
+	}
 }
 
 //
@@ -60,15 +81,34 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	if op == "Append" {
+		ori := ck.Get(key)
+		ck.PutAppend(key, ori+value, "Put")
+		return
+	}
 	args := &PutAppendArgs{
+		Op:    OpPut,
 		Key:   key,
 		Value: value,
-		Op:    op,
 	}
 	reply := &PutAppendReply{}
-	for i := range ck.servers {
-		if ok := ck.servers[i].Call("KVServer.PutAppend", args, reply); ok {
-			DPrintf("%v", reply)
+	if ok := ck.servers[ck.cachedLeader].Call("KVServer.PutAppend", args, reply); ok {
+		if reply.Err == OK {
+			return
+		}
+	}
+	for {
+		for i := range ck.servers {
+			if ok := ck.servers[i].Call("KVServer.PutAppend", args, reply); ok {
+				DPrintf("%v", reply)
+				if reply.Err == ErrWrongLeader {
+					continue
+				}
+				ck.cachedLeader = i
+				if reply.Err == OK {
+					return
+				}
+			}
 		}
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -22,15 +23,38 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+
+	// ClerkID and PropID are used to identify a propose
+	ClerkID int
+	PropID  int
+
 	Type  string
 	Key   string
 	Value string
 }
 
-type waiter struct {
-	index int
-	ch    chan int
+const (
+	OpGet    = "GET"
+	OpPut    = "PUT"
+	OpAppend = "APPEND"
+)
+
+type OpRequest struct {
+	Op
+	RespCh chan Err
+	Value  string
 }
+
+type ApplyResult struct {
+	ClerkID int
+	PropID  int
+	Index   int
+	// Value is set if it is a get op
+	Value string
+	Error Err
+}
+
+const rpcReqQueueSize = 1000
 
 type KVServer struct {
 	mu      sync.Mutex
@@ -43,32 +67,206 @@ type KVServer struct {
 
 	// Your definitions here.
 
-	waiters []waiter
+	// the state machine
+	nextPropID int
+	database   map[string]string
+
+	rpcReqQueue chan *OpRequest
+
+	condLock        *sync.Cond
+	applyResultsBuf []*ApplyResult
+	applyResults    chan *ApplyResult
 }
 
-func (kv *KVServer) addWaitIdxLocked(idx int, ch chan int) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
+func encodeOp(op Op) []byte {
+	w := new(bytes.Buffer)
+	enc := labgob.NewEncoder(w)
+	enc.Encode(op.ClerkID)
+	enc.Encode(op.PropID)
+	enc.Encode(op.Type)
+	enc.Encode(op.Key)
+	enc.Encode(op.Value)
+	return w.Bytes()
+}
+
+func decodeOp(data []byte) (Op, error) {
+	var op Op
+	r := bytes.NewBuffer(data)
+	dec := labgob.NewDecoder(r)
+	if err := dec.Decode(&op.ClerkID); err != nil {
+		return Op{}, err
+	}
+	if err := dec.Decode(&op.PropID); err != nil {
+		return Op{}, err
+	}
+	if err := dec.Decode(&op.Type); err != nil {
+		return Op{}, err
+	}
+	if err := dec.Decode(&op.Key); err != nil {
+		return Op{}, err
+	}
+	if err := dec.Decode(&op.Value); err != nil {
+		return Op{}, err
+	}
+	return op, nil
+}
+
+func (kv *KVServer) starter() {
+	for req := range kv.rpcReqQueue {
+		// consume remain apply results
+		for {
+			select {
+			case <-kv.applyResults:
+			default:
+				goto Work
+			}
+		}
+	Work:
+		DPrintf("[server %d] starter process req %v", kv.me, req)
+
+		req.ClerkID = kv.me
+		req.PropID = kv.nextPropID
+		kv.nextPropID++
+
+		data := encodeOp(req.Op)
+		index, _, isLeader := kv.rf.Start(data)
+		DPrintf("[server %d] starter start req %v index %d isLeader %v", kv.me, req, index, isLeader)
+		if !isLeader {
+			req.RespCh <- ErrWrongLeader
+			continue
+		}
+
+		// wait apply result
+		for applyResult := range kv.applyResults {
+			if applyResult.Index > index {
+				req.RespCh <- ErrWrongLeader
+				break
+			}
+			if applyResult.Index == index {
+				if applyResult.ClerkID != req.ClerkID || applyResult.PropID != req.PropID {
+					req.RespCh <- ErrWrongLeader
+				} else {
+					if req.Op.Type == OpGet {
+						if applyResult.Error == ErrNoKey {
+							req.RespCh <- ErrNoKey
+						} else {
+							req.Value = applyResult.Value
+							req.RespCh <- OK
+						}
+					} else {
+						req.RespCh <- OK
+					}
+				}
+				break
+			}
+		}
+	}
+}
+
+func (kv *KVServer) addApplyResultsToBuffer(res *ApplyResult) {
+	kv.condLock.L.Lock()
+	kv.applyResultsBuf = append(kv.applyResultsBuf, res)
+	kv.condLock.Signal()
+	kv.condLock.L.Unlock()
+}
+
+func (kv *KVServer) applyResultsBufConsumer() {
+	for {
+		var res *ApplyResult
+
+		kv.condLock.L.Lock()
+		for len(kv.applyResultsBuf) == 0 {
+			kv.condLock.Wait()
+		}
+		res = kv.applyResultsBuf[0]
+		if len(kv.applyResultsBuf) == 1 {
+			kv.applyResultsBuf = []*ApplyResult{}
+		} else {
+			kv.applyResultsBuf = kv.applyResultsBuf[1:]
+		}
+		kv.condLock.L.Unlock()
+
+		if res != nil {
+			kv.applyResults <- res
+		}
+	}
+}
+
+func (kv *KVServer) applier() {
+	for applyMsg := range kv.applyCh {
+		data, ok := applyMsg.Command.([]byte)
+		if !ok {
+			continue
+		}
+		op, err := decodeOp(data)
+		if err != nil {
+			continue
+		}
+		res := &ApplyResult{
+			ClerkID: op.ClerkID,
+			PropID:  op.PropID,
+			Index:   applyMsg.CommandIndex,
+		}
+		switch op.Type {
+		case OpGet:
+			if value, ok := kv.database[op.Key]; ok {
+				res.Value = value
+				res.Error = OK
+			} else {
+				res.Error = ErrNoKey
+			}
+		case OpPut:
+			kv.database[op.Key] = op.Value
+		case OpAppend:
+			if ori, found := kv.database[op.Key]; found {
+				kv.database[op.Key] = ori + op.Value
+			} else {
+				kv.database[op.Key] = op.Value
+			}
+		}
+		kv.addApplyResultsToBuffer(res)
+	}
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	DPrintf("[server %d] receive get %v", kv.me, args)
-	reply.Value = "BAZ"
+	op := &OpRequest{
+		Op: Op{
+			Type: OpGet,
+			Key:  args.Key,
+		},
+		RespCh: make(chan Err),
+	}
+	kv.rpcReqQueue <- op
+	for kv.killed() == false {
+		select {
+		case reply.Err = <-op.RespCh:
+			reply.Value = op.Value
+			return
+		default:
+		}
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	DPrintf("[server %d] receive put append %v", kv.me, args)
-	op := &Op{
-		Type:  args.Op,
-		Key:   args.Key,
-		Value: args.Value,
+	op := &OpRequest{
+		Op: Op{
+			Type:  args.Op,
+			Key:   args.Key,
+			Value: args.Value,
+		},
+		RespCh: make(chan Err),
 	}
-	index, term, isLeader := kv.rf.Start(op)
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-		return
+	kv.rpcReqQueue <- op
+	for kv.killed() == false {
+		select {
+		case reply.Err = <-op.RespCh:
+			return
+		default:
+		}
 	}
 }
 
@@ -122,6 +320,18 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+
+	kv.nextPropID = 0
+	kv.database = make(map[string]string)
+
+	kv.rpcReqQueue = make(chan *OpRequest, 1000)
+	kv.applyResults = make(chan *ApplyResult, 1000)
+
+	kv.condLock = sync.NewCond(&kv.mu)
+
+	go kv.starter()
+	go kv.applier()
+	go kv.applyResultsBufConsumer()
 
 	return kv
 }
