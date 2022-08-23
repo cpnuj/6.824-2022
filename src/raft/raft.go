@@ -523,8 +523,9 @@ func (rf *Raft) commitEntries() {
 	copy(sortMatch, rf.matchIndex)
 	sort.Ints(sortMatch)
 	newCommit := sortMatch[len(sortMatch)/2+1]
-	if rf.termOfIndex(newCommit) == rf.term {
-		rf.commitIndex = newCommit
+	toCommit := max(rf.commitIndex, newCommit)
+	if rf.termOfIndex(toCommit) == rf.term {
+		rf.commitIndex = toCommit
 	}
 }
 
@@ -751,6 +752,7 @@ func (rf *Raft) handleAppendEntriesArgs(args *AppendEntriesArgs) {
 }
 
 func (rf *Raft) handleAppendEntriesReply(reply *AppendEntriesReply) {
+	DPrintf("[peer %d] handleAppendEntriesReply %v", rf.me, reply)
 	if reply.Term < rf.term {
 		return
 	}
@@ -847,7 +849,8 @@ func (rf *Raft) handleStartRequest(req *StartRequest) {
 
 func (rf *Raft) handleSnapRequest(req *SnapRequest) {
 	DPrintf("[peer %d] snapshot index %d", rf.me, req.index)
-	if req.index < rf.lastIncludedIndex {
+	if req.index <= rf.lastIncludedIndex {
+		return
 		log.Fatalf("snap request index < log last include index")
 	}
 	if req.index > rf.appliedIndex {
