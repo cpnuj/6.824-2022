@@ -78,20 +78,60 @@ type OpRequest struct {
 	Value  string
 }
 
-// ApplyRecord records the applied token for one clerk
-type ApplyRecord map[int]struct{}
-type ApplyRecords map[int]ApplyRecord
+type ApplyRecord struct {
+	Clerk   int
+	Applied *Bitmap
+}
+
+type ApplyHistory struct {
+	Records []ApplyRecord
+}
+
+func (ar *ApplyHistory) Add(clerkID, propID int) {
+	var record *ApplyRecord
+	for i := range ar.Records {
+		if ar.Records[i].Clerk == clerkID {
+			record = &ar.Records[i]
+			break
+		}
+	}
+	if record == nil {
+		ar.Records = append(ar.Records, ApplyRecord{
+			Clerk:   clerkID,
+			Applied: NewBitmap(),
+		})
+		record = &ar.Records[len(ar.Records)-1]
+	}
+	record.Applied.Set(propID)
+}
+
+func (ar *ApplyHistory) Exist(clerkID, propID int) bool {
+	var record *ApplyRecord
+	for i := range ar.Records {
+		if ar.Records[i].Clerk == clerkID {
+			record = &ar.Records[i]
+			break
+		}
+	}
+	if record == nil {
+		return false
+	}
+	return record.Applied.IsSet(propID)
+}
 
 type State struct {
 	Database map[string]string
-	AppRecs  ApplyRecords
+	History  ApplyHistory
 }
 
 func encodeState(state State) []byte {
+	for i := range state.History.Records {
+		state.History.Records[i].Applied.Shrink()
+	}
 	w := new(bytes.Buffer)
 	enc := labgob.NewEncoder(w)
 	enc.Encode(state.Database)
-	enc.Encode(state.AppRecs)
+	enc.Encode(state.History)
 	return w.Bytes()
 }
 
@@ -100,7 +140,7 @@ func decodeState(data []byte) State {
 	r := bytes.NewBuffer(data)
 	dec := labgob.NewDecoder(r)
 	if dec.Decode(&state.Database) != nil ||
-		dec.Decode(&state.AppRecs) != nil {
+		dec.Decode(&state.History) != nil {
 		log.Fatalf("decodeState error")
 	}
 	return state
@@ -114,23 +154,6 @@ type ApplyResult struct {
 	Value string
 	Error Err
 }
-
-func (ar ApplyRecords) Add(clerkID, propID int) {
-	if _, exist := ar[clerkID]; !exist {
-		ar[clerkID] = make(ApplyRecord)
-	}
-	ar[clerkID][propID] = struct{}{}
-}
-
-func (ar ApplyRecords) Exist(clerkID, propID int) bool {
-	if record, ok := ar[clerkID]; ok {
-		_, ok := record[propID]
-		return ok
-	}
-	return false
-}
-
-const rpcReqQueueSize = 1000
 
 type KVServer struct {
 	mu      sync.Mutex
@@ -257,7 +280,7 @@ func (kv *KVServer) applier() {
 			PropID:  op.PropID,
 			Index:   applyMsg.CommandIndex,
 		}
-		if kv.state.AppRecs.Exist(op.ClerkID, op.PropID) == false {
+		if kv.state.History.Exist(op.ClerkID, op.PropID) == false {
 			switch op.Type {
 			case OpGet:
 				if value, ok := kv.state.Database[op.Key]; ok {
@@ -266,22 +289,22 @@ func (kv *KVServer) applier() {
 				} else {
 					res.Error = ErrNoKey
 				}
-				// we don't add OpGet to apply records
+				// we don't add OpGet to apply Records
 			case OpPut:
 				kv.state.Database[op.Key] = op.Value
-				kv.state.AppRecs.Add(op.ClerkID, op.PropID)
+				kv.state.History.Add(op.ClerkID, op.PropID)
 			case OpAppend:
 				if ori, found := kv.state.Database[op.Key]; found {
 					kv.state.Database[op.Key] = ori + op.Value
 				} else {
 					kv.state.Database[op.Key] = op.Value
 				}
-				kv.state.AppRecs.Add(op.ClerkID, op.PropID)
+				kv.state.History.Add(op.ClerkID, op.PropID)
 			}
 		}
 		kv.addApplyResultsToBuffer(res)
 		if kv.maxraftstate != -1 {
-			if kv.persister.RaftStateSize() > kv.maxraftstate/5 {
+			if kv.persister.RaftStateSize() > kv.maxraftstate/2 {
 				data := encodeState(kv.state)
 				kv.rf.Snapshot(applyMsg.CommandIndex, data)
 			}
@@ -385,7 +408,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.state.Database = make(map[string]string)
-	kv.state.AppRecs = make(ApplyRecords)
+	kv.state.History = ApplyHistory{Records: []ApplyRecord{}}
 
 	kv.rpcReqQueue = make(chan *OpRequest, 1000)
 	kv.applyResults = make(chan *ApplyResult, 1000)
