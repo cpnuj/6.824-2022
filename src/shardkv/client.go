@@ -8,7 +8,11 @@ package shardkv
 // talks to the group that holds the key's shard.
 //
 
-import "6.824/labrpc"
+import (
+	"6.824/kvraft"
+	"6.824/labrpc"
+	"sync"
+)
 import "crypto/rand"
 import "math/big"
 import "6.824/shardctrler"
@@ -40,6 +44,10 @@ type Clerk struct {
 	config   shardctrler.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+	mu sync.Mutex
+
+	ClerkID int
+	propID  int
 }
 
 //
@@ -56,7 +64,17 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.sm = shardctrler.MakeClerk(ctrlers)
 	ck.make_end = make_end
 	// You'll have to add code here.
+	ck.ClerkID = int(nrand())
+	ck.propID = 0
 	return ck
+}
+
+func (ck *Clerk) getPropID() int {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	ret := ck.propID
+	ck.propID++
+	return ret
 }
 
 //
@@ -68,6 +86,8 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 func (ck *Clerk) Get(key string) string {
 	args := GetArgs{}
 	args.Key = key
+	args.ClerkID = ck.ClerkID
+	args.PropID = ck.getPropID()
 
 	for {
 		shard := key2shard(key)
@@ -103,8 +123,13 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args := PutAppendArgs{}
 	args.Key = key
 	args.Value = value
-	args.Op = op
-
+	if op == "Put" {
+		args.Op = kvraft.OpPut
+	} else {
+		args.Op = kvraft.OpAppend
+	}
+	args.ClerkID = ck.ClerkID
+	args.PropID = ck.getPropID()
 
 	for {
 		shard := key2shard(key)
