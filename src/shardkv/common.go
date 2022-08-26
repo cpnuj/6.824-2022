@@ -1,6 +1,8 @@
 package shardkv
 
-import "log"
+import (
+	"log"
+)
 
 //
 // Sharded key/value server.
@@ -11,7 +13,7 @@ import "log"
 // You will have to modify these definitions.
 //
 
-const Debug = true
+const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -56,4 +58,26 @@ type GetArgs struct {
 type GetReply struct {
 	Err   Err
 	Value string
+}
+
+type GetShardArgs struct {
+	ClerkID int
+	PropID  int
+	Shard   int
+}
+
+type GetShardReply struct {
+	Err  Err
+	Data map[string]string
+}
+
+type PutShardArgs struct {
+	// Num is the corresponding config of put shard
+	Num   int
+	Shard int
+	Data  map[string]string
+}
+
+type PutShardReply struct {
+	Err Err
 }
