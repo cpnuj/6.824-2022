@@ -29,8 +29,9 @@ type Op struct {
 	Value string
 
 	// OpGetShard and OpPutShard
-	Shard int
-	Data  map[string]string
+	Shard   int
+	Data    map[string]string
+	History ApplyHistory
 
 	// OpPutShard
 	Num int
@@ -63,6 +64,7 @@ func encodeOp(op Op) []byte {
 	enc.Encode(op.Value)
 	enc.Encode(op.Shard)
 	enc.Encode(op.Data)
+	enc.Encode(op.History)
 	enc.Encode(op.Num)
 	enc.Encode(op.Config)
 	return w.Bytes()
@@ -91,6 +93,9 @@ func decodeOp(data []byte) (Op, error) {
 		return Op{}, err
 	}
 	if err := dec.Decode(&op.Data); err != nil {
+		return Op{}, err
+	}
+	if err := dec.Decode(&op.History); err != nil {
 		return Op{}, err
 	}
 	if err := dec.Decode(&op.Num); err != nil {
@@ -208,8 +213,17 @@ func (ar *ApplyHistory) Exist(clerkID, propID int) bool {
 }
 
 type Shard struct {
-	Status int
-	Data   map[string]string
+	Status  int
+	Data    map[string]string
+	History ApplyHistory
+}
+
+func NewShard() *Shard {
+	return &Shard{
+		Status:  Working,
+		Data:    make(map[string]string),
+		History: ApplyHistory{},
+	}
 }
 
 func (s *Shard) String() string {
@@ -226,7 +240,7 @@ type ConfigStatus struct {
 	Config              shardctrler.Config
 	Rebalancing         bool
 	PendingOutgoing     map[int]int // outgoing shard --> target gid
-	PendingOutgoingData map[int]map[string]string
+	PendingOutgoingData map[int]Shard
 }
 
 func encodeConfigStatus(status ConfigStatus) string {
@@ -248,7 +262,6 @@ type State struct {
 	Config          shardctrler.Config
 	Rebalancing     bool
 	PendingOutgoing map[int]int // outgoing shard --> target gid
-	History         ApplyHistory
 }
 
 func NewState() State {
@@ -261,22 +274,7 @@ func NewState() State {
 		},
 		Rebalancing:     false,
 		PendingOutgoing: map[int]int{},
-		History:         ApplyHistory{Records: make([]ApplyRecord, 0)},
 	}
-}
-
-func encodeConfig(config shardctrler.Config) string {
-	w := new(bytes.Buffer)
-	enc := labgob.NewEncoder(w)
-	enc.Encode(config)
-	return w.String()
-}
-
-func decodeConfig(config string) (ret shardctrler.Config) {
-	r := bytes.NewReader([]byte(config))
-	dec := labgob.NewDecoder(r)
-	dec.Decode(&ret)
-	return
 }
 
 func encodePendingOutgoing(outgoing map[int]int) string {
@@ -284,13 +282,6 @@ func encodePendingOutgoing(outgoing map[int]int) string {
 	enc := labgob.NewEncoder(w)
 	enc.Encode(outgoing)
 	return w.String()
-}
-
-func decodePendingOutgoing(outgoing string) (ret map[int]int) {
-	r := bytes.NewReader([]byte(outgoing))
-	dec := labgob.NewDecoder(r)
-	dec.Decode(&ret)
-	return
 }
 
 func (s *State) Add(key, value string) Err {
@@ -343,127 +334,136 @@ func (s *State) Apply(op Op, index int, gid int) ApplyResult {
 		Error:   OK,
 	}
 
-	if s.History.Exist(op.ClerkID, op.PropID) == false {
-		switch op.Type {
-		case OpGet:
-			switch op.Key {
-			case KeyConfigNum:
-				res.Value = strconv.Itoa(s.Config.Num)
-			case KeyConfig:
-				status := ConfigStatus{
-					Config:              s.Config,
-					Rebalancing:         s.Rebalancing,
-					PendingOutgoing:     s.PendingOutgoing,
-					PendingOutgoingData: make(map[int]map[string]string),
-				}
-				for shardNum, _ := range s.PendingOutgoing {
-					status.PendingOutgoingData[shardNum] = s.Shards[shardNum].Data
-				}
-				res.Value = encodeConfigStatus(status)
-			case KeyOutgoingShards:
-				res.Value = encodePendingOutgoing(s.PendingOutgoing)
-			default:
-				if value, err := s.Get(op.Key); err != OK {
-					res.Error = err
-				} else {
-					res.Value = value
-				}
+	switch op.Type {
+	case OpGet:
+		switch op.Key {
+		case KeyConfigNum:
+			res.Value = strconv.Itoa(s.Config.Num)
+		case KeyConfig:
+			status := ConfigStatus{
+				Config:              s.Config,
+				Rebalancing:         s.Rebalancing,
+				PendingOutgoing:     s.PendingOutgoing,
+				PendingOutgoingData: make(map[int]Shard),
 			}
-
-		case OpGetShard:
-			if s, exist := s.Shards[op.Shard]; exist {
-				res.Data = s.Data
+			for shardNum, _ := range s.PendingOutgoing {
+				status.PendingOutgoingData[shardNum] = *s.Shards[shardNum]
+			}
+			res.Value = encodeConfigStatus(status)
+		case KeyOutgoingShards:
+			res.Value = encodePendingOutgoing(s.PendingOutgoing)
+		default:
+			if value, err := s.Get(op.Key); err != OK {
+				res.Error = err
 			} else {
+				res.Value = value
+			}
+		}
+
+	case OpGetShard:
+		if s, exist := s.Shards[op.Shard]; exist {
+			res.Data = s.Data
+		} else {
+			res.Error = ErrWrongGroup
+		}
+
+	case OpPutShard:
+		if op.Num > s.Config.Num {
+			res.Error = ErrWrongGroup
+			// panic("op.Num > kv.state.Config.Num")
+		} else if op.Num < s.Config.Num {
+			// skip
+		} else {
+			shard, exist := s.Shards[op.Shard]
+			if !exist {
 				res.Error = ErrWrongGroup
 			}
-
-		case OpPutShard:
-			if op.Num > s.Config.Num {
-				res.Error = ErrWrongGroup
-				// panic("op.Num > kv.state.Config.Num")
-			} else if op.Num < s.Config.Num {
-				// skip
-			} else {
-				shard, exist := s.Shards[op.Shard]
-				if !exist {
-					res.Error = ErrWrongGroup
-				}
-				if shard.Status == Incoming {
-					s.AddShard(op.Shard, op.Data)
-				}
-				shard.Status = Working
-				s.maybeFinishRebalancing()
+			if shard.Status == Incoming {
+				shard.Data = op.Data
+				shard.History = op.History
 			}
-
-		case OpCloseShard:
-			delete(s.PendingOutgoing, op.Shard)
-			delete(s.Shards, op.Shard)
-			s.maybeFinishRebalancing()
-
-		case OpPut:
-			res.Error = s.Add(op.Key, op.Value)
-			if res.Error == OK {
-				s.History.Add(op.ClerkID, op.PropID)
-			}
-
-		case OpAppend:
-			ori, err := s.Get(op.Key)
-			if err == ErrWrongGroup {
-				res.Error = ErrWrongGroup
-			} else if err == ErrNoKey {
-				res.Error = s.Add(op.Key, op.Value)
-			} else {
-				res.Error = s.Add(op.Key, ori+op.Value)
-			}
-			if res.Error == OK {
-				s.History.Add(op.ClerkID, op.PropID)
-			}
-
-		case OpConfig:
-			config := op.Config
-			incomingShards := make([]int, 0)
-			outgoingShards := make(map[int]int, 0)
-			if config.Num != s.Config.Num+1 {
-				// skip?
-				return res
-			}
-			for i := range config.Shards {
-				_, haveShard := s.Shards[i]
-				if config.Shards[i] == gid && haveShard == false {
-					incomingShards = append(incomingShards, i)
-				} else if config.Shards[i] != gid && haveShard == true {
-					outgoingShards[i] = config.Shards[i]
-				}
-			}
-			for _, shard := range incomingShards {
-				s.Shards[shard] = &Shard{
-					Status: Incoming,
-					Data:   make(map[string]string),
-				}
-			}
-			for shard := range outgoingShards {
-				if s, exist := s.Shards[shard]; exist {
-					s.Status = Outgoing
-				}
-			}
-			s.Config = config
-			s.Rebalancing = true
-			s.PendingOutgoing = outgoingShards
-			// in initial config, we set all shards to be working
-			if config.Num == 1 {
-				for _, shard := range s.Shards {
-					shard.Status = Working
-				}
-			}
+			shard.Status = Working
 			s.maybeFinishRebalancing()
 		}
+
+	case OpCloseShard:
+		delete(s.PendingOutgoing, op.Shard)
+		delete(s.Shards, op.Shard)
+		s.maybeFinishRebalancing()
+
+	case OpPut:
+		shardNum := key2shard(op.Key)
+		shard, exist := s.Shards[shardNum]
+		if !exist || shard.Status != Working {
+			res.Error = ErrWrongGroup
+		} else {
+			shard.Data[op.Key] = op.Value
+			shard.History.Add(op.ClerkID, op.PropID)
+		}
+
+	case OpAppend:
+		shardNum := key2shard(op.Key)
+		shard, exist := s.Shards[shardNum]
+		if !exist || shard.Status != Working {
+			res.Error = ErrWrongGroup
+			return res
+		}
+		if shard.History.Exist(op.ClerkID, op.PropID) == false {
+			ori, exist := shard.Data[op.Key]
+			if !exist {
+				shard.Data[op.Key] = op.Value
+			} else {
+				shard.Data[op.Key] = ori + op.Value
+			}
+			shard.History.Add(op.ClerkID, op.PropID)
+		}
+
+	case OpConfig:
+		config := op.Config
+		incomingShards := make([]int, 0)
+		outgoingShards := make(map[int]int, 0)
+		if config.Num != s.Config.Num+1 {
+			// skip?
+			return res
+		}
+		for i := range config.Shards {
+			_, haveShard := s.Shards[i]
+			if config.Shards[i] == gid && haveShard == false {
+				incomingShards = append(incomingShards, i)
+			} else if config.Shards[i] != gid && haveShard == true {
+				outgoingShards[i] = config.Shards[i]
+			}
+		}
+		for _, shard := range incomingShards {
+			s.Shards[shard] = &Shard{
+				Status: Incoming,
+				Data:   make(map[string]string),
+			}
+		}
+		for shard := range outgoingShards {
+			if s, exist := s.Shards[shard]; exist {
+				s.Status = Outgoing
+			}
+		}
+		s.Config = config
+		s.Rebalancing = true
+		s.PendingOutgoing = outgoingShards
+		// in initial config, we set all shards to be working
+		if config.Num == 1 {
+			for _, shard := range s.Shards {
+				shard.Status = Working
+			}
+		}
+		s.maybeFinishRebalancing()
 	}
 	return res
 }
 
 func encodeState(state State) []byte {
-	for i := range state.History.Records {
-		state.History.Records[i].Applied.Shrink()
+	for _, shard := range state.Shards {
+		for i := range shard.History.Records {
+			shard.History.Records[i].Applied.Shrink()
+		}
 	}
 	w := new(bytes.Buffer)
 	enc := labgob.NewEncoder(w)
@@ -471,7 +471,6 @@ func encodeState(state State) []byte {
 	enc.Encode(state.Config)
 	enc.Encode(state.Rebalancing)
 	enc.Encode(state.PendingOutgoing)
-	enc.Encode(state.History)
 	return w.Bytes()
 }
 
@@ -482,8 +481,7 @@ func decodeState(data []byte) State {
 	if dec.Decode(&state.Shards) != nil ||
 		dec.Decode(&state.Config) != nil ||
 		dec.Decode(&state.Rebalancing) != nil ||
-		dec.Decode(&state.PendingOutgoing) != nil ||
-		dec.Decode(&state.History) != nil {
+		dec.Decode(&state.PendingOutgoing) != nil {
 		log.Fatalf("decodeState error")
 	}
 	return state
@@ -678,9 +676,10 @@ func (kv *ShardKV) rebalancer() {
 				for shard, target := range pendingOutgoing {
 					data := configStatus.PendingOutgoingData[shard]
 					args := PutShardArgs{
-						Num:   config.Num,
-						Shard: shard,
-						Data:  data,
+						Num:     config.Num,
+						Shard:   shard,
+						Data:    data.Data,
+						History: data.History,
 					}
 					reply := PutShardReply{}
 
@@ -848,10 +847,11 @@ func (kv *ShardKV) PutShard(args *PutShardArgs, reply *PutShardReply) {
 	defer DPrintf("[server %d-%d] reply put shard %v", kv.gid, kv.me, reply)
 	op := &OpRequest{
 		Op: Op{
-			Type:  OpPutShard,
-			Num:   args.Num,
-			Shard: args.Shard,
-			Data:  args.Data,
+			Type:    OpPutShard,
+			Num:     args.Num,
+			Shard:   args.Shard,
+			Data:    args.Data,
+			History: args.History,
 		},
 		RespCh: make(chan Err),
 	}

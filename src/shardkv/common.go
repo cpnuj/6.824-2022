@@ -73,9 +73,10 @@ type GetShardReply struct {
 
 type PutShardArgs struct {
 	// Num is the corresponding config of put shard
-	Num   int
-	Shard int
-	Data  map[string]string
+	Num     int
+	Shard   int
+	Data    map[string]string
+	History ApplyHistory
 }
 
 type PutShardReply struct {
